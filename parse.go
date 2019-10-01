@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"time"
 )
 
 
@@ -38,6 +39,7 @@ type Entry struct {
 	Trak decimal.Decimal
 	Lat decimal.Decimal
 	Long decimal.Decimal
+	PosTime int64
 }
 
 
@@ -82,15 +84,106 @@ func defineSouth() *geofence.Geofence {
 	return fence
 }
 
+const (
+	Unknown = iota
+	North = iota
+	South = iota
+)
 
+type Flight struct {
+	Reg string
+	Direction int
+	StartTrack time.Time
+	Expires time.Time
+	Captures int
+	InNorth bool
+	InSouth bool
+}
 
-func evaluate(filename string, entries *Entries, north *geofence.Geofence, south *geofence.Geofence) {
+type Capture struct {
+	Reg string
+	Captured time.Time
+	Location int
+	Direction int
+}
+
+func outputFlight(output chan Flight) {
+	for flight := range output {
+		var directionType string
+		switch flight.Direction {
+		case South:
+			directionType = "South"
+		case North:
+			directionType = "North"
+		default:
+			directionType = "Unknown"
+		}
+		fmt.Printf("Flight: Reg %s, Moving: %s\n", flight.Reg, directionType)
+	}
+}
+
+func processFlights(flights map[string]Flight, defaultExpiry time.Duration, captures chan Capture) {
+	output := make(chan Flight)
+	go outputFlight(output)
+
+	for capture := range captures {
+		flight, ok := flights[capture.Reg]
+		if ok {
+			// if we've expired, consider this a new session
+			if capture.Captured.Before(flight.Expires) {
+				flight.Captures++
+
+				if capture.Location == South && !flight.InSouth {
+					flight.InSouth = true
+				} else if capture.Location == North && !flight.InNorth {
+					flight.InNorth = true
+				}
+
+				if flight.InSouth && flight.InSouth && flight.Captures >= 2 {
+					//fmt.Println("All conditions met", flight)
+					delete(flights, capture.Reg)
+					output <- flight
+				} else {
+					//fmt.Println("Conditions unmet:", flight)
+				}
+
+				continue
+			}
+		}
+
+		flight = Flight{
+			Reg:        capture.Reg,
+			Direction:  capture.Direction,
+			StartTrack: capture.Captured,
+			Expires:    capture.Captured.Add(defaultExpiry),
+			InNorth:    capture.Location == North,
+			InSouth:    capture.Location == South,
+			Captures:   1,
+		}
+
+		flights[capture.Reg] = flight
+	}
+}
+
+func getDirection(track decimal.Decimal) int {
+	intTrack := track.IntPart()
+	if intTrack >= 110 && intTrack <= 160 {
+		return South
+	}
+	if intTrack >= 290 && intTrack <= 350 {
+		return North
+	}
+
+	return Unknown
+}
+
+func evaluate(filename string, entries *Entries, north *geofence.Geofence, south *geofence.Geofence, captures chan Capture) {
 	for _, entry := range entries.AcList {
 		if len(entry.Reg) == 0 || entry.Lat.IsZero() || entry.Long.IsZero() {
 			continue
 		}
 
-		if (entry.Alt < 2250 && entry.GAlt < 2250) || (entry.Alt > 2750 && entry.GAlt > 2750) {
+		if (entry.Alt < 3250 && entry.GAlt < 3250) || (entry.Alt > 4750 && entry.GAlt > 4750) {
 			continue
 		}
 
@@ -99,23 +192,44 @@ func evaluate(filename string, entries *Entries, north *geofence.Geofence, south
 		point := geo.NewPoint(lat, long)
 
 		if north.Inside(point) {
-			fmt.Println(filename, "North", entry.Reg, entry.Lat, entry.Long, entry.Alt, entry.GAlt, entry.Trak)
+			direction := getDirection(entry.Trak)
+			if direction != Unknown {
+				captures <- Capture {
+					Reg: entry.Reg,
+					Captured: time.Unix(0, entry.PosTime*1000),
+					Location: North,
+					Direction: direction,
+				}
+				//fmt.Print("Captured ")
+			}
+			//fmt.Println(filename, "North", entry.Reg, entry.Lat, entry.Long, entry.Alt, entry.GAlt, entry.Trak)
 		}
 		if south.Inside(point) {
-			fmt.Println(filename, "South", entry.Reg, entry.Lat, entry.Long, entry.Alt, entry.GAlt, entry.Trak)
+			direction := getDirection(entry.Trak)
+			if direction != Unknown {
+				captures <- Capture {
+					Reg: entry.Reg,
+					Captured: time.Unix(0, entry.PosTime*1000),
+					Location: South,
+					Direction: direction,
+				}
+				//fmt.Print("Captured ")
+			}
+
+			//fmt.Println(filename, "South", entry.Reg, entry.Lat, entry.Long, entry.Alt, entry.GAlt, entry.Trak)
 		}
 
 	}
 }
 
 
-func processZipFile(zipFile *zip.File, north *geofence.Geofence, south *geofence.Geofence, sem chan bool) {
+func processZipFile(zipFile *zip.File, north *geofence.Geofence, south *geofence.Geofence, sem chan bool, captures chan Capture) {
 	entries, err := parseZip(zipFile)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	evaluate(zipFile.Name, entries, north, south)
+	evaluate(zipFile.Name, entries, north, south, captures)
 
 	<- sem
 }
@@ -130,12 +244,17 @@ func processZip(zipFilename string, north *geofence.Geofence, south *geofence.Ge
 
 	concurrency := 8
 	sem := make(chan bool, concurrency)
+	captures := make(chan Capture)
+	flights := make(map[string]Flight)
+	defaultDuration, _ := time.ParseDuration("20m")
+
+	go processFlights(flights, defaultDuration, captures)
 
 	for _, f := range r.File {
 		fmt.Println(f.Name)
 
 		sem <- true
-		go processZipFile(f, north, south, sem)
+		go processZipFile(f, north, south, sem, captures)
 	}
 
 	for i := 0; i < cap(sem); i++ {
