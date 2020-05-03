@@ -1,16 +1,18 @@
 package main
 
 import (
-	"fmt"
 	geo "github.com/kellydunn/golang-geo"
 	"github.com/ornen/go-sbs1"
 	"github.com/weilunwu/go-geofence"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
+
+var logger = log.New(os.Stdout, "", log.LstdFlags)
 
 func defineNorth() *geofence.Geofence {
 	polygon := []*geo.Point{
@@ -20,7 +22,7 @@ func defineNorth() *geofence.Geofence {
 		geo.NewPoint(33.9630468, -118.4462214),
 	}
 
-	fence := geofence.NewGeofence([][]*geo.Point{polygon, []*geo.Point{}})
+	fence := geofence.NewGeofence([][]*geo.Point{polygon, {}})
 	return fence
 }
 
@@ -32,7 +34,7 @@ func defineSouth() *geofence.Geofence {
 		geo.NewPoint(33.9154800, -118.4184122),
 	}
 
-	fence := geofence.NewGeofence([][]*geo.Point{polygon, []*geo.Point{}})
+	fence := geofence.NewGeofence([][]*geo.Point{polygon, {}})
 	return fence
 }
 
@@ -64,6 +66,7 @@ type flightInfo struct {
 	InNorth    bool
 	InSouth    bool
 
+	Captures     int
 	FullCaptures int
 	Processed    bool
 }
@@ -119,7 +122,7 @@ func outputFlight(output chan *flightInfo) {
 		default:
 			directionType = "Unknown"
 		}
-		fmt.Printf("flightInfo: Reg %s, Moving: %s\n", flight.Callsign, directionType)
+		logger.Printf("flightInfo: Reg %s, Moving: %s\n", flight.Callsign, directionType)
 	}
 }
 
@@ -135,6 +138,7 @@ func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry ti
 
 		// if flightInfo was already processed, skip
 		if ok && flight.Processed {
+			mutex.Unlock()
 			continue
 		}
 
@@ -153,11 +157,18 @@ func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry ti
 			measures <- measure{flightsCreated: 1}
 		}
 
+		flight.Captures++
+
 		switch e := capture.(type) {
 		case capturedRegistration:
 			flight.Callsign = e.Callsign
 		case capturedTrack:
-			flight.Direction = getDirection(e.Track)
+			direction := getDirection(e.Track)
+
+			// don't overwrite direction with Unknown; first detected direction is good enough unless it flips
+			if direction != locationUnknown {
+				flight.Direction = direction
+			}
 		case capturedAltitude:
 			flight.AltitudeOk = true
 		case capturedLocation:
@@ -272,7 +283,7 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 	conn, err := net.Dial("tcp", "192.168.7.153:30003")
 
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 
 	defer conn.Close()
@@ -298,7 +309,7 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 				return
 			case <-cleanupTicker.C:
 				flightsMutex.Lock()
-				log.Println("Cleaning up flights...")
+				logger.Println("Cleaning up flights...")
 				removed := 0
 				for key, flight := range flights {
 					if time.Now().Sub(flight.Expires) > cleanup {
@@ -306,7 +317,7 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 						removed++
 					}
 				}
-				log.Printf("Removed %v flights\n", removed)
+				logger.Printf("Removed %v flights\n", removed)
 				flightsMutex.Unlock()
 
 				measures <- measure{flightsExpired: removed}
@@ -333,21 +344,20 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 			case <-reportDone:
 				return
 			case <-reportTicker.C:
-				flightsMutex.Lock()
 				flightCount := 0
 				satisfiedFlightCount := 0
 				for _, flight := range flights {
 					flightCount++
 					if fullySatisfied(flight) {
 						satisfiedFlightCount++
+						logger.Println("Satisfied", flight)
 					} else {
-						log.Println("Partial", flight)
+						logger.Println("Partial", flight)
 					}
 				}
-				log.Printf("Flights: %v, satisfied: %v\n", flightCount, satisfiedFlightCount)
-				flightsMutex.Unlock()
+				logger.Printf("Flights: %v, satisfied: %v\n", flightCount, satisfiedFlightCount)
 
-				log.Printf("%+v\n", aggregateMeasure)
+				logger.Printf("%+v\n", aggregateMeasure)
 			}
 		}
 	}()
@@ -370,15 +380,15 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 			if err == io.EOF {
 				break
 			} else {
-				log.Println(err)
+				logger.Println(err)
 				measures <- measure{messagesWithErrors: 1}
 				continue
 			}
 		}
 
-		//log.Println(message)
+		//logger.Println(message)
 		evaluateSBS1Message(message, north, south, captures, measures)
-		//log.Printf("%v\n", recorded)
+		//logger.Printf("%v\n", recorded)
 	}
 }
 
