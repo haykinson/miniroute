@@ -47,17 +47,17 @@ const (
 )
 
 type measure struct {
-	messagesReceived             int
-	messagesWithErrors           int
-	messagesWithAltitude         int
-	messagesWithTrack            int
-	messagesWithCallsign         int
-	messagesWithLocation         int
-	messagesWithMatchingAltitude int
-	messagesWithMatchingLocation int
-	flightsCreated               int
-	flightsExpired               int
-	flightsOutput                int
+	messagesReceived             uint64
+	messagesWithErrors           uint64
+	messagesWithAltitude         uint64
+	messagesWithTrack            uint64
+	messagesWithCallsign         uint64
+	messagesWithLocation         uint64
+	messagesWithMatchingAltitude uint64
+	messagesWithMatchingLocation uint64
+	flightsCreated               uint64
+	flightsExpired               uint64
+	flightsOutput                uint64
 }
 
 type flightInfo struct {
@@ -113,19 +113,7 @@ type keyedCapture interface {
 	Key() string
 }
 
-func outputFlight(output chan *flightInfo) {
-	var grpcClient FlightServiceClient = nil
-
-	if useGrpc {
-		grpcConn, err := grpc.Dial(fmt.Sprintf("%v:%v", submitRpcHost, submitRpcPort), grpc.WithInsecure())
-		if err != nil {
-			logger.Fatal(fmt.Sprintf("Could not connect to gRPC (host:port=%v:%v): %v", submitRpcHost, submitRpcPort, err))
-		}
-		defer grpcConn.Close()
-
-		grpcClient = NewFlightServiceClient(grpcConn)
-	}
-
+func outputFlight(output chan *flightInfo, grpcClient FlightServiceClient) {
 	for flight := range output {
 		var directionType RecordDetectedFlightRequest_Direction
 		switch flight.Direction {
@@ -145,10 +133,7 @@ func outputFlight(output chan *flightInfo) {
 		}
 
 		if useGrpc {
-			ctx := context.Background()
-			ctx = metadata.AppendToOutgoingContext(ctx, "auth", "password")
-
-			_, err := grpcClient.RecordDetectedFlight(ctx, &request)
+			_, err := grpcClient.RecordDetectedFlight(grpcContext(), &request)
 			if err != nil {
 				logger.Printf("Error sending data via gRPC: %v", err)
 			}
@@ -156,9 +141,15 @@ func outputFlight(output chan *flightInfo) {
 	}
 }
 
-func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry time.Duration, captures chan keyedCapture, measures chan measure) {
+func grpcContext() context.Context {
+	ctx := context.Background()
+	ctx = metadata.AppendToOutgoingContext(ctx, "auth", "password")
+	return ctx
+}
+
+func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry time.Duration, captures chan keyedCapture, measures chan measure, grpcClient FlightServiceClient) {
 	output := make(chan *flightInfo)
-	go outputFlight(output)
+	go outputFlight(output, grpcClient)
 
 	for capture := range captures {
 
@@ -318,6 +309,18 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 
 	defer conn.Close()
 
+	var grpcClient FlightServiceClient = nil
+
+	if useGrpc {
+		grpcConn, err := grpc.Dial(fmt.Sprintf("%v:%v", submitRpcHost, submitRpcPort), grpc.WithInsecure())
+		if err != nil {
+			logger.Fatal(fmt.Sprintf("Could not connect to gRPC (host:port=%v:%v): %v", submitRpcHost, submitRpcPort, err))
+		}
+		defer grpcConn.Close()
+
+		grpcClient = NewFlightServiceClient(grpcConn)
+	}
+
 	var reader = sbs1.NewReader(conn)
 
 	captures := make(chan keyedCapture)
@@ -350,7 +353,7 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 				logger.Printf("Removed %v flights\n", removed)
 				flightsMutex.Unlock()
 
-				measures <- measure{flightsExpired: removed}
+				measures <- measure{flightsExpired: uint64(removed)}
 			}
 		}
 	}()
@@ -382,6 +385,17 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 			}
 		}()
 
+		heartbeat := func() {
+			if !useGrpc {
+				return
+			}
+
+			_, err := grpcClient.Heartbeat(grpcContext(), &HeartbeatRequest{Timestamp: ptypes.TimestampNow(), MessageCount: aggregateMeasure.messagesReceived})
+			if err != nil {
+				logger.Println("Received error from heartbeat", err)
+			}
+		}
+
 		for {
 			select {
 			case <-reportDone:
@@ -403,6 +417,7 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 				logger.Printf("Flights: %v, satisfied: %v\n", flightCount, satisfiedFlightCount)
 
 				logger.Printf("%+v\n", aggregateMeasure)
+				heartbeat()
 			}
 		}
 	}()
@@ -415,7 +430,7 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 		reportDone <- true
 	}()
 
-	go processFlights(flights, flightsMutex, expiration, captures, measures)
+	go processFlights(flights, flightsMutex, expiration, captures, measures, grpcClient)
 
 	for {
 		var message, err = reader.Read()

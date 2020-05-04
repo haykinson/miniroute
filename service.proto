@@ -6,6 +6,8 @@ import "google/protobuf/timestamp.proto";
 
 service FlightService {
     rpc RecordDetectedFlight(RecordDetectedFlightRequest) returns (RecordDetectedFlightResponse);
+
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 message RecordDetectedFlightRequest {
@@ -20,6 +22,11 @@ message RecordDetectedFlightRequest {
     google.protobuf.Timestamp timestamp = 3;
 }
 
-message RecordDetectedFlightResponse {
+message RecordDetectedFlightResponse { }
 
+message HeartbeatRequest {
+    google.protobuf.Timestamp timestamp = 1;
+    uint64 message_count = 2;
 }
+
+message HeartbeatResponse { }

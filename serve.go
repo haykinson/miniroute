@@ -26,8 +26,10 @@ const (
 type flightServiceServer struct {
 	UnimplementedFlightServiceServer
 
-	redisClient *redis.Client
-	expiration  time.Duration
+	redisClient   *redis.Client
+	expiration    time.Duration
+	lastHeartbeat time.Time
+	messageCount  uint64
 }
 
 func contains(haystack []string, needle string) bool {
@@ -40,7 +42,16 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
-func (f flightServiceServer) RecordDetectedFlight(ctx context.Context, in *RecordDetectedFlightRequest) (*RecordDetectedFlightResponse, error) {
+func (f *flightServiceServer) Heartbeat(ctx context.Context, in *HeartbeatRequest) (*HeartbeatResponse, error) {
+	ts, err := ptypes.Timestamp(in.Timestamp)
+	if err == nil {
+		f.lastHeartbeat = ts
+	}
+	f.messageCount += in.MessageCount
+	return &HeartbeatResponse{}, nil
+}
+
+func (f *flightServiceServer) RecordDetectedFlight(ctx context.Context, in *RecordDetectedFlightRequest) (*RecordDetectedFlightResponse, error) {
 	headers, ok := metadata.FromIncomingContext(ctx)
 	if !(ok && headers["auth"] != nil && contains(headers["auth"], "password")) {
 		return nil, status.Error(codes.PermissionDenied, "Permission denied")
@@ -56,7 +67,7 @@ func (f flightServiceServer) RecordDetectedFlight(ctx context.Context, in *Recor
 	return &RecordDetectedFlightResponse{}, nil
 }
 
-func initGrpc(flightService flightServiceServer) {
+func initGrpc(flightService *flightServiceServer) {
 	lis, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%v", grpcListen))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
@@ -69,8 +80,10 @@ func initGrpc(flightService flightServiceServer) {
 }
 
 type DataForTemplate struct {
-	Title   string
-	Flights []*RecordDetectedFlightRequest
+	Title         string
+	MessageCount  uint64
+	LastHeartbeat time.Time
+	Flights       []*RecordDetectedFlightRequest
 }
 
 func (f *flightServiceServer) handleWebRequest(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +108,7 @@ func (f *flightServiceServer) handleWebRequest(w http.ResponseWriter, r *http.Re
 		Funcs(template.FuncMap{"timestampConverter": ptypes.TimestampString}).
 		ParseFiles("template.html")
 
-	err := t.Execute(w, DataForTemplate{Title: "foo", Flights: flights})
+	err := t.Execute(w, DataForTemplate{Title: "foo", Flights: flights, LastHeartbeat: f.lastHeartbeat, MessageCount: f.messageCount})
 	if err != nil {
 		logger.Println(err)
 	}
@@ -138,7 +151,7 @@ func main() {
 
 	flightService := newService()
 
-	go initGrpc(flightService)
+	go initGrpc(&flightService)
 
 	http.HandleFunc("/", flightService.handleWebRequest)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%v", webListen), nil))

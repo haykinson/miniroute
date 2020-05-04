@@ -5,3 +5,5 @@
       {{ timestampConverter .Timestamp }} — <span style="font-weight: bold">{{ .Callsign }}</span> — {{ .Direction }}
   </div>
 {{ end }}
+
+<div style="font-size: small">Last heartbeat: {{ .LastHeartbeat }}<br/>Messages since restart: {{ .MessageCount }}</div>
