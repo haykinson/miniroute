@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+option go_package = ".;main";
+
+import "google/protobuf/timestamp.proto";
+
+service FlightService {
+    rpc RecordDetectedFlight(RecordDetectedFlightRequest) returns (RecordDetectedFlightResponse);
+}
+
+message RecordDetectedFlightRequest {
+    enum Direction {
+        UNKNOWN = 0;
+        NORTH = 1;
+        SOUTH = 2;
+    }
+
+    string callsign = 1;
+    Direction direction = 2;
+    google.protobuf.Timestamp timestamp = 3;
+}
+
+message RecordDetectedFlightResponse {
+
+}

@@ -1,0 +1,7 @@
+<h1>Recent Flights</h1>
+
+{{ range .Flights }}
+  <div>
+      {{ timestampConverter .Timestamp }} — <span style="font-weight: bold">{{ .Callsign }}</span> — {{ .Direction }}
+  </div>
+{{ end }}

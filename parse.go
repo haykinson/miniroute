@@ -1,18 +1,20 @@
 package main
 
 import (
+	"context"
+	"flag"
+	"fmt"
+	"github.com/golang/protobuf/ptypes"
 	geo "github.com/kellydunn/golang-geo"
 	"github.com/ornen/go-sbs1"
 	"github.com/weilunwu/go-geofence"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"io"
-	"log"
 	"net"
-	"os"
 	"sync"
 	"time"
 )
-
-var logger = log.New(os.Stdout, "", log.LstdFlags)
 
 func defineNorth() *geofence.Geofence {
 	polygon := []*geo.Point{
@@ -112,17 +114,45 @@ type keyedCapture interface {
 }
 
 func outputFlight(output chan *flightInfo) {
+	var grpcClient FlightServiceClient = nil
+
+	if useGrpc {
+		grpcConn, err := grpc.Dial(fmt.Sprintf("%v:%v", submitRpcHost, submitRpcPort), grpc.WithInsecure())
+		if err != nil {
+			logger.Fatal(fmt.Sprintf("Could not connect to gRPC (host:port=%v:%v): %v", submitRpcHost, submitRpcPort, err))
+		}
+		defer grpcConn.Close()
+
+		grpcClient = NewFlightServiceClient(grpcConn)
+	}
+
 	for flight := range output {
-		var directionType string
+		var directionType RecordDetectedFlightRequest_Direction
 		switch flight.Direction {
 		case locationSouth:
-			directionType = "South"
+			directionType = RecordDetectedFlightRequest_SOUTH
 		case locationNorth:
-			directionType = "North"
+			directionType = RecordDetectedFlightRequest_NORTH
 		default:
-			directionType = "Unknown"
+			directionType = RecordDetectedFlightRequest_UNKNOWN
 		}
 		logger.Printf("flightInfo: Reg %s, Moving: %s\n", flight.Callsign, directionType)
+
+		request := RecordDetectedFlightRequest{
+			Callsign:  flight.Callsign,
+			Direction: directionType,
+			Timestamp: ptypes.TimestampNow(),
+		}
+
+		if useGrpc {
+			ctx := context.Background()
+			ctx = metadata.AppendToOutgoingContext(ctx, "auth", "password")
+
+			_, err := grpcClient.RecordDetectedFlight(ctx, &request)
+			if err != nil {
+				logger.Printf("Error sending data via gRPC: %v", err)
+			}
+		}
 	}
 }
 
@@ -280,7 +310,7 @@ func evaluateSBS1Message(message *sbs1.Message, north *geofence.Geofence, south 
 }
 
 func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
-	conn, err := net.Dial("tcp", "192.168.7.153:30003")
+	conn, err := net.Dial("tcp", fmt.Sprintf("%v:30003", sbsHost))
 
 	if err != nil {
 		logger.Fatal(err)
@@ -327,23 +357,37 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 
 	go func() {
 		aggregateMeasure := measure{}
+
+		// allows incomplete writes into aggregateMeasure
+		go func() {
+			for {
+				select {
+				case measure, ok := <-measures:
+					if !ok {
+						return
+					}
+
+					aggregateMeasure.messagesReceived += measure.messagesReceived
+					aggregateMeasure.messagesWithErrors += measure.messagesWithErrors
+					aggregateMeasure.flightsCreated += measure.flightsCreated
+					aggregateMeasure.flightsExpired += measure.flightsExpired
+					aggregateMeasure.flightsOutput += measure.flightsOutput
+					aggregateMeasure.messagesWithAltitude += measure.messagesWithAltitude
+					aggregateMeasure.messagesWithCallsign += measure.messagesWithCallsign
+					aggregateMeasure.messagesWithLocation += measure.messagesWithLocation
+					aggregateMeasure.messagesWithTrack += measure.messagesWithTrack
+					aggregateMeasure.messagesWithMatchingAltitude += measure.messagesWithMatchingAltitude
+					aggregateMeasure.messagesWithMatchingLocation += measure.messagesWithMatchingLocation
+				}
+			}
+		}()
+
 		for {
 			select {
-			case measure := <-measures:
-				aggregateMeasure.messagesReceived += measure.messagesReceived
-				aggregateMeasure.messagesWithErrors += measure.messagesWithErrors
-				aggregateMeasure.flightsCreated += measure.flightsCreated
-				aggregateMeasure.flightsExpired += measure.flightsExpired
-				aggregateMeasure.flightsOutput += measure.flightsOutput
-				aggregateMeasure.messagesWithAltitude += measure.messagesWithAltitude
-				aggregateMeasure.messagesWithCallsign += measure.messagesWithCallsign
-				aggregateMeasure.messagesWithLocation += measure.messagesWithLocation
-				aggregateMeasure.messagesWithTrack += measure.messagesWithTrack
-				aggregateMeasure.messagesWithMatchingAltitude += measure.messagesWithMatchingAltitude
-				aggregateMeasure.messagesWithMatchingLocation += measure.messagesWithMatchingLocation
 			case <-reportDone:
 				return
 			case <-reportTicker.C:
+				flightsMutex.Lock()
 				flightCount := 0
 				satisfiedFlightCount := 0
 				for _, flight := range flights {
@@ -355,6 +399,7 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 						logger.Println("Partial", flight)
 					}
 				}
+				flightsMutex.Unlock()
 				logger.Printf("Flights: %v, satisfied: %v\n", flightCount, satisfiedFlightCount)
 
 				logger.Printf("%+v\n", aggregateMeasure)
@@ -419,7 +464,27 @@ func initTransmissionTypes() {
 	transmissionTypesWithCoords[sbs1.TransmissionTypeESAirbornePos] = true
 }
 
+var (
+	sbsHost       string
+	submitRpcHost string
+	submitRpcPort int
+	useGrpc       bool
+)
+
+func initParsingFlags() {
+	flag.StringVar(&sbsHost, "sbshost", "192.168.7.153", "Host where the SBS1 server is located")
+	flag.StringVar(&submitRpcHost, "grpchost", "192.168.7.153", "Host where the gRPC server is located")
+	flag.IntVar(&submitRpcPort, "grpcport", 50051, "Port of the gRPC server")
+	flag.BoolVar(&useGrpc, "usegrpc", false, "Whether to use the gRPC server")
+
+	flag.Parse()
+}
+
 func main() {
+	initParsingFlags()
+
+	initLogging()
+
 	north := defineNorth()
 	south := defineSouth()
 	initTransmissionTypes()
