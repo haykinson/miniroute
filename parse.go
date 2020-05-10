@@ -46,6 +46,14 @@ const (
 	locationSouth   = iota
 )
 
+type corridorRecord struct {
+	FullCaptures int
+	InNorth      bool
+	InSouth      bool
+
+	Processed bool
+}
+
 type measure struct {
 	messagesReceived             uint64
 	messagesWithErrors           uint64
@@ -57,20 +65,21 @@ type measure struct {
 	messagesWithMatchingLocation uint64
 	flightsCreated               uint64
 	flightsExpired               uint64
-	flightsOutput                uint64
+	flightsOutputMiniroute       uint64
+	flightsOutputSFRA            uint64
 }
 
 type flightInfo struct {
-	Callsign   string
-	Direction  int
-	AltitudeOk bool
-	Expires    time.Time
-	InNorth    bool
-	InSouth    bool
+	Altitude int
 
-	Captures     int
-	FullCaptures int
-	Processed    bool
+	Callsign  string
+	Direction int
+	Expires   time.Time
+
+	Captures int
+
+	SFRA      corridorRecord
+	Miniroute corridorRecord
 }
 
 type capturedRegistration struct {
@@ -85,7 +94,7 @@ type capturedTrack struct {
 
 type capturedAltitude struct {
 	HexId    string
-	Altitude int32
+	Altitude int
 }
 
 type capturedLocation struct {
@@ -124,12 +133,23 @@ func outputFlight(output chan *flightInfo, grpcClient FlightServiceClient) {
 		default:
 			directionType = RecordDetectedFlightRequest_UNKNOWN
 		}
-		logger.Printf("flightInfo: Reg %s, Moving: %s\n", flight.Callsign, directionType)
+
+		var corridorType RecordDetectedFlightRequest_Corridor
+		if flight.Miniroute.Processed {
+			corridorType = RecordDetectedFlightRequest_CORRIDOR_MINIROUTE
+		} else if flight.SFRA.Processed {
+			corridorType = RecordDetectedFlightRequest_CORRIDOR_SFRA
+		} else {
+			corridorType = RecordDetectedFlightRequest_CORRIDOR_UNKNOWN
+		}
+
+		logger.Printf("flightInfo: Reg %s, Moving: %s, Corridor: %s\n", flight.Callsign, directionType, corridorType)
 
 		request := RecordDetectedFlightRequest{
 			Callsign:  flight.Callsign,
 			Direction: directionType,
 			Timestamp: ptypes.TimestampNow(),
+			Corridor:  corridorType,
 		}
 
 		if useGrpc {
@@ -158,7 +178,7 @@ func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry ti
 		flight, ok := flights[capture.Key()]
 
 		// if flightInfo was already processed, skip
-		if ok && flight.Processed {
+		if ok && (flight.Miniroute.Processed || flight.SFRA.Processed) {
 			mutex.Unlock()
 			continue
 		}
@@ -191,24 +211,44 @@ func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry ti
 				flight.Direction = direction
 			}
 		case capturedAltitude:
-			flight.AltitudeOk = true
+			flight.Altitude = e.Altitude
 		case capturedLocation:
 			if e.Location == locationNorth {
-				flight.InNorth = true
+				if altitudeMiniroute(flight.Altitude) {
+					flight.Miniroute.InNorth = true
+				} else if altitudeSFRA(flight.Altitude) {
+					flight.SFRA.InNorth = true
+				}
 			} else if e.Location == locationSouth {
-				flight.InSouth = true
+				if altitudeMiniroute(flight.Altitude) {
+					flight.Miniroute.InSouth = true
+				} else if altitudeSFRA(flight.Altitude) {
+					flight.SFRA.InSouth = true
+				}
 			}
 		default:
 			panic("unknown capture type")
 		}
 
-		if fullySatisfied(flight) {
-			flight.FullCaptures++
+		if satisfiesMiniroute(flight) {
+			flight.Miniroute.FullCaptures++
 
-			if flight.FullCaptures >= 2 {
-				flight.Processed = true
-				measures <- measure{flightsOutput: 1}
+			if flight.Miniroute.FullCaptures >= 2 {
+				flight.Miniroute.Processed = true
+				measures <- measure{flightsOutputMiniroute: 1}
 				output <- flight
+				continue
+			}
+		}
+
+		if satisfiesSFRA(flight) {
+			flight.SFRA.FullCaptures++
+
+			if flight.SFRA.FullCaptures >= 2 {
+				flight.SFRA.Processed = true
+				measures <- measure{flightsOutputSFRA: 1}
+				output <- flight
+				continue
 			}
 		}
 
@@ -216,12 +256,28 @@ func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry ti
 	}
 }
 
-func fullySatisfied(flight *flightInfo) bool {
+func satisfiesMiniroute(flight *flightInfo) bool {
 	return len(flight.Callsign) > 0 &&
-		flight.AltitudeOk &&
-		flight.InNorth &&
-		flight.InSouth &&
+		altitudeMiniroute(flight.Altitude) &&
+		flight.Miniroute.InNorth &&
+		flight.Miniroute.InSouth &&
 		flight.Direction != locationUnknown
+}
+
+func satisfiesSFRA(flight *flightInfo) bool {
+	return len(flight.Callsign) > 0 &&
+		altitudeSFRA(flight.Altitude) &&
+		flight.SFRA.InNorth &&
+		flight.SFRA.InSouth &&
+		flight.Direction != locationUnknown
+}
+
+func altitudeMiniroute(altitude int) bool {
+	return altitude > 2250 && altitude < 2750
+}
+
+func altitudeSFRA(altitude int) bool {
+	return (altitude > 3250 && altitude < 3750) || (altitude > 4250 && altitude < 4750)
 }
 
 func getDirection(track float64) int {
@@ -254,10 +310,10 @@ func evaluateSBS1Message(message *sbs1.Message, north *geofence.Geofence, south 
 	if transmissionTypesWithAltitude[message.TransmissionType] {
 		measures <- measure{messagesWithAltitude: 1}
 
-		if message.Altitude >= 3250 && message.Altitude <= 4750 {
+		if message.Altitude >= 2250 && message.Altitude <= 4750 {
 			captures <- capturedAltitude{
 				HexId:    message.HexId,
-				Altitude: message.Altitude,
+				Altitude: int(message.Altitude),
 			}
 			measures <- measure{messagesWithMatchingAltitude: 1}
 			recorded = true
@@ -374,7 +430,8 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 					aggregateMeasure.messagesWithErrors += measure.messagesWithErrors
 					aggregateMeasure.flightsCreated += measure.flightsCreated
 					aggregateMeasure.flightsExpired += measure.flightsExpired
-					aggregateMeasure.flightsOutput += measure.flightsOutput
+					aggregateMeasure.flightsOutputMiniroute += measure.flightsOutputMiniroute
+					aggregateMeasure.flightsOutputSFRA += measure.flightsOutputSFRA
 					aggregateMeasure.messagesWithAltitude += measure.messagesWithAltitude
 					aggregateMeasure.messagesWithCallsign += measure.messagesWithCallsign
 					aggregateMeasure.messagesWithLocation += measure.messagesWithLocation
@@ -403,18 +460,22 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 			case <-reportTicker.C:
 				flightsMutex.Lock()
 				flightCount := 0
-				satisfiedFlightCount := 0
+				satisfiedMiniroute := 0
+				satisfiedSFRA := 0
 				for _, flight := range flights {
 					flightCount++
-					if fullySatisfied(flight) {
-						satisfiedFlightCount++
-						logger.Println("Satisfied", flight)
+					if satisfiesMiniroute(flight) {
+						satisfiedMiniroute++
+						logger.Println("Miniroute", flight)
+					} else if satisfiesSFRA(flight) {
+						satisfiedSFRA++
+						logger.Println("Miniroute", flight)
 					} else {
 						logger.Println("Partial", flight)
 					}
 				}
 				flightsMutex.Unlock()
-				logger.Printf("Flights: %v, satisfied: %v\n", flightCount, satisfiedFlightCount)
+				logger.Printf("Flights: %v, miniroute: %v, sfra: %v\n", flightCount, satisfiedMiniroute, satisfiedSFRA)
 
 				logger.Printf("%+v\n", aggregateMeasure)
 				heartbeat()

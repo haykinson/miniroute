@@ -20,7 +20,9 @@ import (
 )
 
 const (
-	key = "k"
+	keyMiniroute = "miniroute"
+	keySFRA = "sfra"
+	keyUnknown = "k"
 )
 
 type flightServiceServer struct {
@@ -58,6 +60,16 @@ func (f *flightServiceServer) RecordDetectedFlight(ctx context.Context, in *Reco
 	}
 
 	bytes, _ := proto.Marshal(in)
+
+	var key string
+	if in.Corridor == RecordDetectedFlightRequest_CORRIDOR_MINIROUTE {
+		key = keyMiniroute
+	} else if in.Corridor == RecordDetectedFlightRequest_CORRIDOR_SFRA {
+		key = keySFRA
+	} else {
+		key = keyUnknown
+	}
+
 	f.redisClient.LPush(key, bytes)
 	f.redisClient.Expire(key, f.expiration)
 	f.redisClient.LTrim(key, 0, int64(numToList))
@@ -83,35 +95,53 @@ type DataForTemplate struct {
 	Title         string
 	MessageCount  uint64
 	LastHeartbeat time.Time
-	Flights       []*RecordDetectedFlightRequest
+	FlightsMiniroute       []*RecordDetectedFlightRequest
+	FlightsSFRA       []*RecordDetectedFlightRequest
 }
 
 func (f *flightServiceServer) handleWebRequest(w http.ResponseWriter, r *http.Request) {
-	results := f.redisClient.LRange(key, 0, int64(numToList))
+	resultsMiniroute := f.redisClient.LRange(keyMiniroute, 0, int64(numToList))
+	resultsSFRA := f.redisClient.LRange(keySFRA, 0, int64(numToList))
 
-	flights := make([]*RecordDetectedFlightRequest, 0)
-	for _, result := range results.Val() {
-		flight := &RecordDetectedFlightRequest{}
-		if err := proto.Unmarshal([]byte(result), flight); err != nil {
-			logger.Fatal("Could not unmarshal stored proto")
-			fmt.Fprint(w, "Error")
-			return
-		}
-
-		flights = append(flights, flight)
+	flightsMiniroute, err := unmarshalFlightsFromRedis(resultsMiniroute)
+	if err != nil {
+		fmt.Fprint(w, "Error")
+		logger.Printf("Error while unmarshalling miniroute: %v\n", err)
+		return
 	}
 
-	logger.Printf("flights: %v\n", flights)
+	flightsSFRA, err := unmarshalFlightsFromRedis(resultsSFRA)
+	if err != nil {
+		fmt.Fprint(w, "Error")
+		logger.Printf("Error while unmarshalling sfra: %v\n", err)
+		return
+	}
+
+	logger.Printf("flights: miniroute: %v, sfra: %v\n", flightsMiniroute, flightsSFRA)
 
 	t, _ := template.
 		New("template.html").
 		Funcs(template.FuncMap{"timestampConverter": ptypes.TimestampString}).
 		ParseFiles("template.html")
 
-	err := t.Execute(w, DataForTemplate{Title: "foo", Flights: flights, LastHeartbeat: f.lastHeartbeat, MessageCount: f.messageCount})
+	err = t.Execute(w, DataForTemplate{Title: "foo", FlightsMiniroute: flightsMiniroute, FlightsSFRA: flightsSFRA, LastHeartbeat: f.lastHeartbeat, MessageCount: f.messageCount})
 	if err != nil {
 		logger.Println(err)
 	}
+}
+
+func unmarshalFlightsFromRedis(results *redis.StringSliceCmd) ([]*RecordDetectedFlightRequest, error) {
+	flights := make([]*RecordDetectedFlightRequest, 0)
+	for _, result := range results.Val() {
+		flight := &RecordDetectedFlightRequest{}
+		if err := proto.Unmarshal([]byte(result), flight); err != nil {
+			logger.Fatal("Could not unmarshal stored proto")
+			return nil, err
+		}
+
+		flights = append(flights, flight)
+	}
+	return flights, nil
 }
 
 func newService() flightServiceServer {

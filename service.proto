@@ -17,9 +17,16 @@ message RecordDetectedFlightRequest {
         SOUTH = 2;
     }
 
+    enum Corridor {
+        CORRIDOR_UNKNOWN = 0;
+        CORRIDOR_SFRA = 1;
+        CORRIDOR_MINIROUTE = 2;
+    }
+
     string callsign = 1;
     Direction direction = 2;
     google.protobuf.Timestamp timestamp = 3;
+    Corridor corridor = 4;
 }
 
 message RecordDetectedFlightResponse { }
