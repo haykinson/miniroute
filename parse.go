@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -237,7 +238,6 @@ func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry ti
 				flight.Miniroute.Processed = true
 				measures <- measure{flightsOutputMiniroute: 1}
 				output <- flight
-				continue
 			}
 		}
 
@@ -248,7 +248,6 @@ func processFlights(flights map[string]*flightInfo, mutex *sync.Mutex, expiry ti
 				flight.SFRA.Processed = true
 				measures <- measure{flightsOutputSFRA: 1}
 				output <- flight
-				continue
 			}
 		}
 
@@ -301,7 +300,7 @@ func evaluateSBS1Message(message *sbs1.Message, north *geofence.Geofence, south 
 	if transmissionTypesWithCallsign[message.TransmissionType] {
 		captures <- capturedRegistration{
 			HexId:    message.HexId,
-			Callsign: message.Callsign,
+			Callsign: strings.TrimSpace(message.Callsign),
 		}
 		measures <- measure{messagesWithCallsign: 1}
 		recorded = true
