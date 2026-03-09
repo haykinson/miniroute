@@ -441,14 +441,19 @@ func processSBS1(north *geofence.Geofence, south *geofence.Geofence) {
 			}
 		}()
 
+		var lastSentMessagesReceived uint64
+
 		heartbeat := func() {
 			if !useGrpc {
 				return
 			}
 
-			_, err := grpcClient.Heartbeat(grpcContext(), &HeartbeatRequest{Timestamp: ptypes.TimestampNow(), MessageCount: aggregateMeasure.messagesReceived})
+			messagesToSend := aggregateMeasure.messagesReceived - lastSentMessagesReceived
+			_, err := grpcClient.Heartbeat(grpcContext(), &HeartbeatRequest{Timestamp: ptypes.TimestampNow(), MessageCount: messagesToSend})
 			if err != nil {
 				logger.Println("Received error from heartbeat", err)
+			} else {
+				lastSentMessagesReceived += messagesToSend
 			}
 		}
 
